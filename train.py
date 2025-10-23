@@ -6,6 +6,7 @@ from torchvision.utils import save_image
 from tqdm import tqdm
 import os
 from dit import DiT  # Ensure you have the DiT class implemented
+from contextlib import nullcontext
 # --- Parameters ---
 EPOCHS = 50
 BATCH_SIZE = 32
@@ -13,6 +14,49 @@ LEARNING_RATE = 1e-4
 IMG_SIZE = 28
 CHANNELS = 1
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- AMP / mixed precision settings ---
+# Set to 'fp16' to use float16 (FP16) autocast + GradScaler (recommended for most GPUs)
+# Set to 'bf16' to use bfloat16 (BF16) autocast. BF16 is preferred when available (A100, H100,
+# or some CPU platforms), it usually does not need gradient scaling. If BF16 isn't supported
+# on the selected device, the code will fall back to no-autocast.
+USE_AMP = True
+AMP_MODE = "bf16"  # options: 'bf16', 'fp16', or None/False to disable
+
+# Configure autocast context and GradScaler depending on device and requested mode
+if USE_AMP and AMP_MODE:
+    amp_dtype = None
+    scaler = None
+
+    if AMP_MODE == "fp16":
+        amp_dtype = torch.float16
+    elif AMP_MODE == "bf16":
+        amp_dtype = torch.bfloat16
+
+    # Prefer CUDA autocast when using GPU
+    if DEVICE.startswith("cuda"):
+        # Check bf16 support when requested
+        if amp_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            print("Warning: CUDA device does not support bfloat16 autocast. Falling back to no AMP.")
+            autocast = nullcontext
+            scaler = None
+        else:
+            autocast = torch.cuda.amp.autocast
+            # Use GradScaler only for fp16 (float16). BF16 typically doesn't need it.
+            scaler = torch.cuda.amp.GradScaler() if amp_dtype is torch.float16 else None
+    else:
+        # CPU: try to use torch.cpu.amp.autocast if available (PyTorch 2.0+). Otherwise no-op.
+        try:
+            autocast = torch.cpu.amp.autocast
+            # BF16 on CPU may be supported; fallback to nullcontext if dtype unsupported.
+            if amp_dtype is None:
+                autocast = nullcontext
+        except AttributeError:
+            autocast = nullcontext
+            scaler = None
+else:
+    autocast = nullcontext
+    scaler = None
 
 # Anisotropic patches for a 28x28 image
 # (1, 2) -> 28x14 grid -> L=392
@@ -43,7 +87,12 @@ def sample(model, device, steps=100, batch_size=16):
         t = time_steps[i]
 
         # Get the predicted vector field v(x_t, t)
-        v_pred = model(x, t.repeat(batch_size))
+        # Use autocast during sampling if configured
+        if USE_AMP and AMP_MODE:
+            with autocast(device_type=("cuda" if device.startswith("cuda") else "cpu"), dtype=amp_dtype):
+                v_pred = model(x, t.repeat(batch_size))
+        else:
+            v_pred = model(x, t.repeat(batch_size))
 
         # Euler step: x_{t+dt} = x_t + v(x_t, t) * dt
         x = x + v_pred * dt
@@ -113,14 +162,28 @@ if __name__ == "__main__":
 
             # Get predicted vector field: v_pred = model(x_t, t)
             # The DiT class expects the time/sigma embed as a 1D tensor
-            vt_pred = model(xt, t)
+            # Mixed precision forward (if enabled)
+            if USE_AMP and AMP_MODE and autocast is not nullcontext:
+                # cuda.autocast / cpu.autocast supports device_type and dtype args
+                with autocast(device_type=("cuda" if DEVICE.startswith("cuda") else "cpu"), dtype=amp_dtype):
+                    vt_pred = model(xt, t)
+                    loss = nn.MSELoss()(vt_pred, vt)
 
-            # 5. Calculate Loss
-            loss = nn.MSELoss()(vt_pred, vt)
-
-            # 6. Backprop
-            loss.backward()
-            optimizer.step()
+                if scaler is not None:
+                    # FP16 path: use GradScaler
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    # BF16 path: backward in normal precision
+                    loss.backward()
+                    optimizer.step()
+            else:
+                # No AMP
+                vt_pred = model(xt, t)
+                loss = nn.MSELoss()(vt_pred, vt)
+                loss.backward()
+                optimizer.step()
 
             if i % 200 == 0:
                 print(f"Epoch {epoch+1}, Step {i}: Loss = {loss.item():.4f}")
