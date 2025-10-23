@@ -2,10 +2,11 @@ import torch
 import numpy as np
 from torch import nn, functional as F
 from einops import rearrange, repeat
+from favor import Attention
 # Assuming these are in your .model file
 ## Diffusion transformer
 
-from favor import Attention
+# from favor import Attention
 # class Attention(nn.Module):
 #     def __init__(self, dim_head, num_heads=8, qkv_bias=False):
 #         super().__init__()
@@ -64,7 +65,8 @@ class DiTBlock(nn.Module):
         dim = dim_head * num_heads
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.norm1 = ModulatedLayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(dim_head, num_heads=num_heads, qkv_bias=True)
+        dim = dim_head * num_heads
+        self.attn = Attention(dim, dim_head=dim_head, heads=num_heads, qkv_bias=True)
         self.norm2 = ModulatedLayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.mlp = nn.Sequential(
                 nn.Linear(dim, mlp_hidden_dim, bias=True),
@@ -112,6 +114,16 @@ def get_2d_pos_embed(grid_h, grid_w, dim, N=10000):
     return nn.Parameter(torch.tensor(embeds_2d).float().unsqueeze(0), # [1, L, dim]
                         requires_grad=False)
 
+def get_sigma_embeds(batches, sigma, scaling_factor=0.5, log_scale=True):
+    if sigma.shape == torch.Size([]):
+        sigma = sigma.unsqueeze(0).repeat(batches)
+    else:
+        assert sigma.shape == (batches,), 'sigma.shape == [] or [batches]!'
+    if log_scale:
+        sigma = torch.log(sigma)
+    s = sigma.unsqueeze(1) * scaling_factor
+    return torch.cat([torch.sin(s), torch.cos(s)], dim=1)
+
 class SigmaEmbedderSinCos(nn.Module):
     def __init__(self, hidden_size, scaling_factor=0.5, log_scale=True):
         super().__init__()
@@ -122,6 +134,17 @@ class SigmaEmbedderSinCos(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
+    def forward(self, batches, sigma):
+        sig_embed = get_sigma_embeds(batches, sigma,
+                                     self.scaling_factor,
+                                     self.log_scale)                      # (B, 2)
+        return self.mlp(sig_embed)     
+
+class CondSequential(nn.Sequential):
+    def forward(self, x, cond):
+        for module in self._modules.values():
+            x = module(x, cond)
+        return x
 
 ## MODIFIED: This is now the AnisotropicDiT
 class DiT(nn.Module):
@@ -160,7 +183,7 @@ class DiT(nn.Module):
         # --- 3. Core Transformer ---
         self.sig_embed = sig_embed or SigmaEmbedderSinCos(dim)
         self.cond_embed = cond_embed
-        self.blocks = nn.ModuleList([
+        self.blocks = CondSequential(*[
             DiTBlock(dim_head, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
 
