@@ -41,9 +41,9 @@ if USE_AMP and AMP_MODE:
             autocast = nullcontext
             scaler = None
         else:
-            autocast = torch.cuda.amp.autocast
+            autocast = torch.amp.autocast
             # Use GradScaler only for fp16 (float16). BF16 typically doesn't need it.
-            scaler = torch.cuda.amp.GradScaler() if amp_dtype is torch.float16 else None
+            scaler = torch.amp.GradScaler() if amp_dtype is torch.float16 else None
     else:
         # CPU: try to use torch.cpu.amp.autocast if available (PyTorch 2.0+). Otherwise no-op.
         try:
